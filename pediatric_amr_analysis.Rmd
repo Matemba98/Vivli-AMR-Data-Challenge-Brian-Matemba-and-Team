@@ -1,0 +1,933 @@
+---
+title: 'Forecasting Pediatric Antimicrobial Resistance: A Spatiotemporal Analysis
+  of Global Surveillance Data'
+author: "Pediatric AMR Forecasting Project"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  word_document:
+    toc: true
+    toc_depth: '2'
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+    number_sections: true
+    df_print: kable
+    theme: flatly
+subtitle: "A single-file, end-to-end analysis in R"
+---
+
+```{r setup, include=FALSE}
+# Global knitr options: hide code echo by default, suppress messages/warnings in
+# the rendered report, and set a consistent figure size and resolution.
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE,
+                      fig.width = 9, fig.height = 5.2, dpi = 150, fig.align = "center")
+```
+
+# Overview
+
+This R Markdown document is a complete, self-contained pediatric antimicrobial-resistance
+(AMR) forecasting analysis. Starting from the raw ATLAS surveillance CSV, it carries out every
+stage end to end: cohort construction, descriptive epidemiology, a hierarchical partial-pooling
+prevalence model, co-resistance networks, antibiogram-pattern mining, an escalating ladder of
+forecasting baselines, an adapted-STAPP model (graph features + multi-head temporal attention
++ focal loss) built in `torch`, validation with bootstrap uncertainty, and all figures and
+tables. Everything needed to run the analysis lives in this one file.
+
+# Package setup
+
+The chunk below lists every package the analysis depends on, installs any that are missing on
+this machine, and then loads them. On a fresh machine the first run will download and install
+packages (and, for `torch`, its C++ backend) before proceeding; subsequent runs simply load
+what is already present.
+
+```{r packages, echo=TRUE}
+# ---- Required packages, with a one-line note on what each is used for ----
+required_pkgs <- c(
+  "data.table",  # fast CSV reading and in-memory data manipulation
+  "dplyr",       # data wrangling verbs
+  "tidyr",       # reshaping between wide and long formats
+  "stringr",     # string handling
+  "purrr",       # functional iteration helpers
+  "ggplot2",     # all figures
+  "scales",      # axis label formatting (commas, percentages, log scales)
+  "viridis",     # colour-blind-safe fill scale for the map
+  "patchwork",   # combining several ggplots into one figure
+  "knitr",       # rendering tables and knitting the report
+  "lme4",        # hierarchical (mixed-effects) binomial prevalence model
+  "glmnet",      # penalised logistic-regression forecasting baseline
+  "ranger",      # random-forest forecasting baseline
+  "torch",       # neural adapted-STAPP model (attention + graph features)
+  "maps"         # country polygons for the choropleth map
+)
+
+# ---- Install any packages that are not already present, then load them all ----
+to_install <- setdiff(required_pkgs, rownames(installed.packages()))
+if (length(to_install)) {
+  message("Installing missing packages: ", paste(to_install, collapse = ", "))
+  install.packages(to_install, repos = "https://cloud.r-project.org")
+}
+invisible(lapply(required_pkgs, function(p)
+  suppressPackageStartupMessages(library(p, character.only = TRUE))))
+
+# ---- torch ships its numerical backend (libtorch) separately; fetch it once if absent ----
+if (!torch::torch_is_installed()) torch::install_torch()
+```
+
+# Global settings
+
+```{r settings, echo=TRUE}
+# ---- A consistent minimal ggplot theme for every figure ----
+theme_set(theme_minimal(base_size = 11) +
+          theme(panel.grid.minor = element_blank(),
+                plot.title = element_text(face = "bold", size = 12)))
+
+# ---- Run-size switch: QUICK = TRUE gives a fast smoke run (fewer seeds/bootstraps) ----
+# Set QUICK <- FALSE for the full analysis; TRUE trades fidelity for a ~90-second run.
+QUICK      <- FALSE
+N_SEEDS    <- if (QUICK) 1 else 5     # random seeds averaged for each neural model
+N_BOOT_EDGE <- if (QUICK) 40 else 500 # bootstrap resamples for co-resistance edge stability
+N_BOOT_MET  <- if (QUICK) 100 else 500 # bootstrap resamples for validation-metric CIs
+
+# ---- Figure palette (named hex colours reused throughout) ----
+NAVY <- "#17324D"; BLUE <- "#2F6B9A"; TEAL <- "#2A9D8F"; GOLD <- "#C58A1B"
+RED <- "#B74D4D"; GRAY <- "#687782"; PURPLE <- "#6B4C9A"; BROWN <- "#8C6239"
+
+# ---- Short italic species labels for figures and tables ----
+SP_SHORT <- c("Escherichia coli"="E. coli","Klebsiella pneumoniae"="K. pneumoniae",
+              "Staphylococcus aureus"="S. aureus","Streptococcus pneumoniae"="S. pneumoniae")
+# Map a full species name to its short label.
+italic_sp <- function(x) SP_SHORT[x]
+```
+
+
+```{r config}
+# ---- Central configuration: every threshold, path and grouping the analysis uses ----
+# Editing values here changes the whole pipeline; nothing downstream is hard-coded.
+CFG <- list(
+  source_csv = "01_data/ATLAS_Antibiotics/atlas_vivli_2004_2024.csv",  # raw ATLAS surveillance file
+  age_group = "0 - 17",                                                # pediatric age band in ATLAS
+  pathogens = c("Escherichia coli","Klebsiella pneumoniae","Staphylococcus aureus","Streptococcus pneumoniae"),
+  outcomes = list(
+    "Escherichia coli" = c("Ceftriaxone","Ceftazidime","Meropenem","Imipenem","Ciprofloxacin","Gentamicin","Amikacin","Trimethoprim sulfa"),
+    "Klebsiella pneumoniae" = c("Ceftriaxone","Ceftazidime","Meropenem","Imipenem","Ciprofloxacin","Gentamicin","Amikacin","Piperacillin tazobactam"),
+    "Staphylococcus aureus" = c("Oxacillin","Cefoxitin","Erythromycin","Clindamycin","Ciprofloxacin","Gentamicin","Tetracycline","Trimethoprim sulfa","Vancomycin","Linezolid"),
+    "Streptococcus pneumoniae" = c("Erythromycin","Azithromycin","Clarithromycin","Penicillin","Ceftriaxone","Levofloxacin","Tetracycline","Trimethoprim sulfa")),
+  thresholds = list(direct_n = 30, pairwise_n = 20, pairwise_q = 0.05, pairwise_abs_phi = 0.15,
+                    stable_edge_fraction = 0.70, pattern_sizes = c(2,3,4), pattern_min_count = 10,
+                    pattern_presence_count = 3, pattern_presence_support = 0.05),
+  validation = list(development = c(2004,2018), tuning = c(2019,2021), locked_test = c(2022,2024),
+                    neural_seeds = c(20260628,20260629,20260630,20260631,20260632)[seq_len(N_SEEDS)]),
+  who_regions = list(
+    AFRO = c("Cameroon","Ghana","Ivory Coast","Kenya","Malawi","Mauritius","Namibia","Nigeria","South Africa","Uganda"),
+    AMRO = c("Argentina","Brazil","Canada","Chile","Colombia","Costa Rica","Dominican Republic","El Salvador","Guatemala","Honduras","Jamaica","Mexico","Nicaragua","Panama","Puerto Rico","United States","Venezuela"),
+    EMRO = c("Egypt","Jordan","Kuwait","Lebanon","Morocco","Oman","Pakistan","Qatar","Saudi Arabia","Tunisia"),
+    EURO = c("Austria","Belgium","Bulgaria","Croatia","Czech Republic","Denmark","Estonia","Finland","France","Germany","Greece","Hungary","Ireland","Israel","Italy","Latvia","Lithuania","Netherlands","Norway","Poland","Portugal","Romania","Russia","Serbia","Slovak Republic","Slovenia","Spain","Sweden","Switzerland","Turkey","Ukraine","United Kingdom"),
+    SEARO = c("India","Indonesia","Thailand"),
+    WPRO = c("Australia","China","Hong Kong","Japan","Korea, South","Malaysia","New Zealand","Philippines","Singapore","Taiwan","Vietnam")))
+# ---- Class-level composite outcomes: an isolate is "resistant" to a class if resistant to any drug in it ----
+# Each entry is (species, composite name, component drugs).
+COMPOSITE_SPECS <- list(
+  list("Escherichia coli","third_generation_cephalosporin",c("Ceftriaxone","Ceftazidime")),
+  list("Escherichia coli","carbapenem",c("Meropenem","Imipenem")),
+  list("Klebsiella pneumoniae","third_generation_cephalosporin",c("Ceftriaxone","Ceftazidime")),
+  list("Klebsiella pneumoniae","carbapenem",c("Meropenem","Imipenem")))
+REGIONS <- c("AFRO","AMRO","EMRO","EURO","SEARO","WPRO")
+
+# ---- Wilson score 95% confidence interval for a binomial proportion (r resistant of n tested) ----
+# More reliable than the normal approximation for small n or proportions near 0/1.
+wilson <- function(r,n,z=1.96){ if(n==0) return(c(NA,NA)); p<-r/n; d<-1+z^2/n
+  c((p+z^2/(2*n))/d - z*sqrt(p*(1-p)/n+z^2/(4*n^2))/d, (p+z^2/(2*n))/d + z*sqrt(p*(1-p)/n+z^2/(4*n^2))/d) }
+```
+
+# Data preparation and cohort
+
+```{r dataprep}
+# ---- Build a country -> WHO region lookup table from the config ----
+region_lookup <- function(cfg) rbindlist(lapply(names(cfg$who_regions), function(r)
+  data.table(Country = cfg$who_regions[[r]], who_region = r)))
+
+# ---- Read the ATLAS CSV and construct the eligible pediatric cohort ----
+# Keeps only the needed columns; filters to the pediatric age band and the four
+# study pathogens; requires at least one AST result; and drops any isolate whose
+# ID is duplicated (so repeated records cannot bias the analysis).
+build_cohort <- function(cfg) {
+  # Interpreted-susceptibility ("_I") columns for every drug in the outcome panels.
+  ast_fields <- paste0(unique(unlist(cfg$outcomes)), "_I")
+  keep <- c("Isolate Id","Study","Species","Country","State","Gender","Age Group","Speciality","Source","Year", ast_fields)
+  # Only request columns that actually exist in the file header.
+  hdr <- names(fread(cfg$source_csv, nrows = 0)); keep <- keep[keep %in% hdr]; ast_fields <- ast_fields[ast_fields %in% hdr]
+  dt <- fread(cfg$source_csv, select = keep, showProgress = FALSE)
+  setnames(dt, "Age Group", "AgeGroup")
+  # Filter to pediatric isolates of the four study pathogens.
+  dt <- dt[AgeGroup == cfg$age_group & Species %in% cfg$pathogens]
+  # Keep only isolates with at least one non-blank AST interpretation.
+  ap <- Reduce(`|`, lapply(ast_fields, function(f) !is.na(dt[[f]]) & trimws(dt[[f]]) != ""))
+  dt <- dt[ap]
+  # Drop every row belonging to a duplicated Isolate Id.
+  dup <- dt[, .N, by = `Isolate Id`][N > 1, `Isolate Id`]
+  dt[!(`Isolate Id` %in% dup)]
+}
+
+# ---- Attach WHO region to each isolate and coerce Year to integer ----
+harmonise <- function(dt, cfg) {
+  dt <- merge(dt, region_lookup(cfg), by = "Country", all.x = TRUE, sort = FALSE)
+  dt[, Year := as.integer(Year)][]
+}
+
+# ---- Reshape wide AST columns into one long row per isolate-drug ----
+# Recodes ATLAS text categories to S / I / R, and adds a binary resistance flag
+# (drug_R = 1 for Resistant, 0 for Susceptible, NA otherwise).
+to_long_ast <- function(dt, cfg) {
+  recs <- list()
+  for (sp in names(cfg$outcomes)) { sub <- dt[Species == sp]; if (!nrow(sub)) next
+    for (d in cfg$outcomes[[sp]]) { f <- paste0(d,"_I"); if (!f %in% names(sub)) next
+      a <- sub[[f]]; code <- fifelse(a=="Susceptible","S",fifelse(a=="Intermediate","I",fifelse(a=="Resistant","R",NA_character_)))
+      recs[[paste(sp,d)]] <- data.table(`Isolate Id`=sub$`Isolate Id`,Species=sp,Country=sub$Country,
+        who_region=sub$who_region,Year=sub$Year,drug=d,ast=code) } }
+  long <- rbindlist(recs); long[, drug_R := fifelse(ast=="R",1L,fifelse(ast=="S",0L,NA_integer_))][]
+}
+
+# ---- Derive class-level composite phenotypes (e.g. any 3GC, any carbapenem) ----
+# For each isolate the composite is R if resistant to any component drug, else I,
+# else S, following the precedence R > I > S.
+build_composites <- function(long, specs) {
+  out <- list()
+  for (s in specs) { sp<-s[[1]];cls<-s[[2]];drugs<-s[[3]]; sub<-long[Species==sp & drug %in% drugs]; if(!nrow(sub)) next
+    agg <- sub[, .(any_r=any(ast=="R",na.rm=TRUE),any_i=any(ast=="I",na.rm=TRUE),any_obs=any(!is.na(ast))),
+               by=.(`Isolate Id`,Species,Country,who_region,Year)]
+    agg[, ast := fifelse(any_r,"R",fifelse(any_i,"I",fifelse(any_obs,"S",NA_character_)))]
+    agg[, drug := cls][, drug_R := fifelse(ast=="R",1L,fifelse(ast=="S",0L,NA_integer_))]
+    out[[paste(cls,sp)]] <- agg[, .(`Isolate Id`,Species,drug,Country,who_region,Year,ast,drug_R)] }
+  rbindlist(out)
+}
+
+# ---- Run the data-prep steps and assemble the analysis tables ----
+dt   <- harmonise(build_cohort(CFG), CFG)   # harmonised isolate-level cohort
+long <- to_long_ast(dt, CFG)                # one row per isolate-drug (single agents)
+comp <- build_composites(long, COMPOSITE_SPECS)  # composite class outcomes
+# Combined long table (single agents + composites) used by downstream stages.
+ast_all <- rbindlist(list(long[,.(`Isolate Id`,Species,drug,Country,who_region,Year,ast,drug_R)],
+                          comp[,.(`Isolate Id`,Species,drug,Country,who_region,Year,ast,drug_R)]))
+# Cohort counts by pathogen, with percentage share, for Table 1 / Figure 1.
+cohort_tab <- dt[, .(Isolates = .N), by = Species][order(Species)]
+cohort_tab[, Percent := round(100*Isolates/sum(Isolates),1)]
+```
+
+The eligible cohort comprises **`r nrow(dt)` isolates** from **`r uniqueN(dt$Country)` countries**
+across six WHO regions.
+
+```{r fig1-cohort, fig.height=3.6, fig.cap="Figure 1. Pediatric cohort by pathogen."}
+# Horizontal bar chart of isolate counts per pathogen, labelled with the count.
+ct <- copy(cohort_tab); ct[, lab := italic_sp(Species)]
+ggplot(ct, aes(reorder(lab, Isolates), Isolates, fill = lab)) +
+  geom_col(width = 0.65, show.legend = FALSE) +
+  geom_text(aes(label = comma(Isolates)), hjust = -0.1, size = 3.4, colour = NAVY) +
+  scale_fill_manual(values = c(BLUE, TEAL, GOLD, RED)) +
+  scale_y_continuous(labels = comma, expand = expansion(mult = c(0, .15))) +
+  coord_flip() + labs(x = NULL, y = "Pediatric isolates", title = "Pediatric cohort by pathogen")
+```
+
+```{r tab1-cohort}
+kable(cohort_tab[, .(Pathogen = italic_sp(Species), Isolates = comma(Isolates), `Percent (%)` = Percent)],
+      caption = "Table 1. Pediatric cohort by pathogen.")
+```
+
+```{r fig2-map, fig.height=4.2, fig.cap="Figure 2. Isolates by country (log scale)."}
+# Choropleth of isolate counts per country using base 'maps' world polygons.
+world <- as.data.table(map_data("world"))
+# Crosswalk from ATLAS country names to the names used by the 'maps' package.
+xwalk <- c("United States"="USA","United Kingdom"="UK","Korea, South"="South Korea",
+           "Slovak Republic"="Slovakia","Czech Republic"="Czech Republic","Ivory Coast"="Ivory Coast")
+# Count isolates per country and translate names to the map's convention.
+cc <- dt[, .(n = .N), by = Country]
+cc[, region := ifelse(Country %in% names(xwalk), xwalk[Country], Country)]
+# Join counts onto the polygon table and restore drawing order.
+world <- merge(world, cc[, .(region, n)], by = "region", all.x = TRUE)
+setorder(world, group, order)
+ggplot(world, aes(long, lat, group = group, fill = n)) +
+  geom_polygon(colour = "white", linewidth = 0.1) +
+  scale_fill_viridis(name = "Isolates", trans = "log10", labels = comma, na.value = "grey92", option = "mako", direction = -1) +
+  coord_fixed(1.35, ylim = c(-56, 83)) +
+  labs(title = "Geographic distribution of the pediatric cohort", x = NULL, y = NULL) +
+  theme_void() + theme(plot.title = element_text(face = "bold", size = 12))
+```
+
+# Descriptive
+
+```{r descriptives}
+# ---- Observed resistance prevalence per pathogen-drug-country-region-year cell ----
+# Numerator = resistant isolates, denominator = isolates with an interpretable S/R result.
+observed_prevalence <- function(ast_all) {
+  x <- ast_all[!is.na(drug_R)]
+  c <- x[, .(resistant = sum(drug_R), n = .N), by = .(Species, drug, Country, who_region, Year)]
+  c[, resistance_proportion := resistant / n][]
+}
+
+# ---- Classify each cell by how much data supports it (direct / modelled / insufficient) ----
+# "direct" cells have >= direct_n interpretable results; cells with some but fewer
+# rely on modelling; cells with none are insufficient.
+sufficiency <- function(ast_all, direct_n = 30) {
+  cov <- ast_all[, .(eligible = .N, tested = sum(!is.na(ast)), primary_interpretable = sum(!is.na(drug_R))),
+                 by = .(Species, drug, Country, who_region, Year)]
+  cov[, sufficiency_status := fifelse(primary_interpretable >= direct_n,"direct",
+        fifelse(primary_interpretable > 0,"modelled_only","insufficient_data"))][]
+}
+
+prev  <- observed_prevalence(ast_all)   # observed prevalence table
+suf   <- sufficiency(ast_all, 30)        # data-sufficiency classification
+
+# ---- Priority pathogen-drug outcomes reported in the descriptive tables/figures ----
+# Each entry is (species, drug/composite, display label).
+PRIMARY <- list(
+  c("Escherichia coli","third_generation_cephalosporin","E. coli: 3GC"),
+  c("Escherichia coli","carbapenem","E. coli: carbapenem"),
+  c("Klebsiella pneumoniae","third_generation_cephalosporin","K. pneumoniae: 3GC"),
+  c("Klebsiella pneumoniae","carbapenem","K. pneumoniae: carbapenem"),
+  c("Staphylococcus aureus","Oxacillin","S. aureus: oxacillin (MRSA proxy)"),
+  c("Streptococcus pneumoniae","Erythromycin","S. pneumoniae: erythromycin"),
+  c("Streptococcus pneumoniae","Penicillin","S. pneumoniae: penicillin"))
+
+# ---- Overall resistance (all years) for each priority outcome, with Wilson 95% CI ----
+prim_rows <- rbindlist(lapply(PRIMARY, function(pp) {
+  g <- ast_all[Species == pp[1] & drug == pp[2] & !is.na(drug_R)]
+  r <- sum(g$drug_R); n <- nrow(g); ci <- wilson(r, n)
+  data.table(Outcome = pp[3], `S/R` = n, Resistant = r, `Resistance (%)` = round(100*r/n,1),
+             `95% CI` = sprintf("%.1f-%.1f", 100*ci[1], 100*ci[2])) }))
+```
+
+```{r tab2-primary}
+kable(prim_rows, caption = "Table 2. Overall primary and secondary resistance outcomes (all years).")
+```
+
+```{r fig3-trends, fig.height=7.5, fig.cap="Figure 3. Weighted annual resistance trajectories with Wilson 95% CIs."}
+# Annual resistance percentage (with Wilson CI band) per priority outcome, faceted.
+trend <- rbindlist(lapply(PRIMARY, function(pp) {
+  g <- ast_all[Species==pp[1] & drug==pp[2] & !is.na(drug_R), .(r=sum(drug_R), n=.N), by=Year]
+  g[, `:=`(Outcome=pp[3], p=100*r/n)]
+  g[, c("lo","hi") := as.list(100*wilson(r,n)), by=Year]; g }))
+ggplot(trend, aes(Year, p)) +
+  annotate("rect", xmin=2021.5, xmax=2024.5, ymin=-Inf, ymax=Inf, fill="grey90") +
+  geom_ribbon(aes(ymin=lo, ymax=hi), fill=BLUE, alpha=0.15) +
+  geom_line(colour=BLUE, linewidth=0.8) + geom_point(colour=BLUE, size=1) +
+  facet_wrap(~Outcome, ncol=2, scales="free_y") +
+  labs(x=NULL, y="Resistant (%)", title="Weighted annual resistance among pediatric ATLAS isolates")
+```
+
+## Hierarchical partial-pooling prevalence model
+
+```{r hierarchical}
+# ---- Fit one hierarchical binomial GLMM for a single pathogen-drug outcome ----
+# Partially pools sparse country estimates: WHO region as a fixed effect, a random
+# intercept and time slope per country, and a random year effect. Returns NULL and
+# is treated as non-converged if the outcome is too sparse or the fit is singular.
+fit_hier <- function(cell, min_c=5, min_r=15) {
+  cell <- as.data.table(cell)
+  # Require enough countries and rows to identify the random effects.
+  if (uniqueN(cell$Country) < min_c || nrow(cell) < min_r) return(NULL)
+  # Standardise time and set grouping factors.
+  cell[, time_z := as.numeric(scale(Year))][, Country := factor(Country)][, who_region := factor(who_region)][, YearF := factor(Year)]
+  # Fit the mixed-effects logistic model; return NULL if it errors.
+  fit <- tryCatch(suppressWarnings(glmer(cbind(resistant, n-resistant) ~ who_region + time_z +
+           (1 + time_z | Country) + (1 | YearF), data = cell, family = binomial,
+           control = glmerControl(optimizer="bobyqa", optCtrl=list(maxfun=2e5)))), error=function(e) NULL)
+  if (is.null(fit)) return(NULL)
+  # Accept only non-singular, converged fits.
+  ok <- !isSingular(fit, 1e-4) && is.null(fit@optinfo$conv$lme4$code)
+  # Partially pooled fitted prevalence for each cell.
+  cell[, hier_mean := plogis(predict(fit, cell, allow.new.levels=TRUE))]
+  list(ok = ok, est = cell)
+}
+
+# ---- Empirical-Bayes beta-binomial shrinkage: the fallback for sparse outcomes ----
+# Shrinks each cell's proportion toward its pathogen-drug grand mean, with a 95%
+# credible interval; used wherever the GLMM does not converge.
+beta_binom <- function(cells) {
+  cells <- as.data.table(copy(cells)); tot <- cells[, .(R=sum(resistant),N=sum(n)), by=.(Species,drug)]
+  tot[, pm := R/N][, ps := pmin(N,100)]; cells <- merge(cells, tot[,.(Species,drug,pm,ps)], by=c("Species","drug"))
+  a <- cells$pm*cells$ps + cells$resistant; b <- (1-cells$pm)*cells$ps + cells$n - cells$resistant
+  cells[, `:=`(posterior_mean=a/(a+b), lo=qbeta(.025,a,b), hi=qbeta(.975,a,b), model_type="beta_binomial")][]
+}
+
+# ---- Fit the GLMM for every outcome, counting how many converge ----
+outc <- unique(prev[, .(Species, drug)]); hier_est <- list(); conv <- 0
+for (i in seq_len(nrow(outc))) {
+  f <- fit_hier(prev[Species==outc$Species[i] & drug==outc$drug[i]])
+  if (!is.null(f) && f$ok) { hier_est[[paste(outc$Species[i],outc$drug[i])]] <- f$est; conv <- conv + 1 }
+}
+
+# ---- Combine estimates: beta-binomial everywhere, overwritten by the GLMM where it converged ----
+final_prev <- beta_binom(prev)
+if (length(hier_est)) {
+  he <- rbindlist(lapply(hier_est, function(x) x[,.(Species,drug,Country,Year,hm=hier_mean)]))
+  final_prev <- merge(final_prev, he, by=c("Species","drug","Country","Year"), all.x=TRUE)
+  final_prev[!is.na(hm), `:=`(posterior_mean=hm, model_type="hierarchical_glmm")][, hm := NULL]
+}
+```
+
+The hierarchical binomial GLMM (WHO region fixed effect; partially pooled country intercept and
+time slope; pooled year effect) converged for **`r conv` of `r nrow(outc)`** pathogen-drug outcomes
+under a singular-fit / convergence gate; the remainder use a beta-binomial partial-pooling fallback.
+
+```{r fig-hier, fig.height=6, fig.cap="Figure S5. Observed vs. partially pooled posterior mean for one converged outcome per pathogen."}
+# Show, for one converged outcome per pathogen, how the model pools noisy country
+# points (dots) toward a smoother partially pooled trend (lines).
+hp <- final_prev[model_type=="hierarchical_glmm"]
+reps <- hp[, .(drug=drug[1]), by=Species]   # one representative outcome per pathogen
+pl <- rbindlist(lapply(seq_len(nrow(reps)), function(i){
+  o <- hp[Species==reps$Species[i] & drug==reps$drug[i]]
+  tc <- o[, .(N=sum(n)), by=Country][order(-N)][seq_len(min(5,.N))]$Country
+  o[Country %in% tc][, lab := paste0(italic_sp(Species),": ",drug)] }))
+if (nrow(pl)) ggplot(pl, aes(Year, 100*posterior_mean, colour=Country)) +
+  geom_line(linewidth=0.6) + geom_point(aes(y=100*resistance_proportion), size=0.8, alpha=0.5) +
+  facet_wrap(~lab, scales="free_y", ncol=2) + guides(colour=guide_legend(ncol=2, override.aes=list(size=1))) +
+  labs(x=NULL, y="Resistant (%)", title="Hierarchical model: observed (points) vs. pooled posterior mean (lines)") +
+  theme(legend.position="bottom", legend.text=element_text(size=6), legend.title=element_blank())
+```
+
+# Co-resistance networks and antibiogram patterns
+
+```{r networks}
+# ---- Phi coefficient (correlation) from a 2x2 contingency table of two drugs' R/S states ----
+phi_tab <- function(a,b,c,d){a<-as.numeric(a);b<-as.numeric(b);c<-as.numeric(c);d<-as.numeric(d)
+  den<-sqrt((a+b)*(c+d)*(a+c)*(b+d)); if(is.na(den)||den==0) return(NA_real_); (a*d-b*c)/den}
+
+# ---- Estimate co-resistance edges between every drug pair within each pathogen-region-year ----
+# For each pair it computes the phi association, a Fisher exact p-value, and a bootstrap
+# "stability" flag (fraction of resamples where the edge stays significant and strong).
+# Edges are later retained on FDR-adjusted q < q_thr and |phi| >= phi_thr.
+pairwise_edges <- function(ast_long, min_n=20, q_thr=0.05, phi_thr=0.15, n_boot=500, stable_frac=0.70, seed=20260628) {
+  set.seed(seed); d <- ast_long[!is.na(drug_R), .(`Isolate Id`,Species,who_region,Year,drug,drug_R)]
+  keys <- unique(d[, .(Species,who_region,Year)]); rows <- list(); k <- 0L
+  # Loop over each pathogen-region-year group.
+  for (i in seq_len(nrow(keys))) {
+    g <- d[Species==keys$Species[i] & who_region==keys$who_region[i] & Year==keys$Year[i]]; if(!nrow(g)) next
+    # Reshape to one row per isolate with a column per drug.
+    wide <- dcast(g, `Isolate Id` ~ drug, value.var="drug_R", fun.aggregate=function(x) x[1])
+    drugs <- setdiff(names(wide), "Isolate Id"); if (length(drugs) < 2) next
+    # Every unordered drug pair.
+    for (ii in seq_len(length(drugs)-1)) for (jj in (ii+1):length(drugs)) {
+      # Isolates tested against both drugs.
+      pr <- wide[!is.na(get(drugs[ii])) & !is.na(get(drugs[jj])), c(drugs[ii],drugs[jj]), with=FALSE]
+      if (nrow(pr) < min_n) next
+      # 2x2 counts and the phi association + Fisher test.
+      L<-pr[[1]];R<-pr[[2]]; a<-sum(L==0&R==0);b<-sum(L==0&R==1);cc<-sum(L==1&R==0);dd<-sum(L==1&R==1)
+      ph<-phi_tab(a,b,cc,dd); ft<-fisher.test(matrix(c(a,cc,b,dd),2,2)); nrp<-nrow(pr); hit<-0L
+      # Bootstrap the isolates; count resamples where the edge stays strong and significant.
+      for (bt in seq_len(n_boot)) { id<-sample.int(nrp,nrp,replace=TRUE); Lb<-L[id];Rb<-R[id]
+        p2<-phi_tab(sum(Lb==0&Rb==0),sum(Lb==0&Rb==1),sum(Lb==1&Rb==0),sum(Lb==1&Rb==1))
+        if(!is.na(p2) && abs(p2)>=phi_thr && pchisq(nrp*p2^2,1,lower.tail=FALSE)<q_thr) hit<-hit+1L }
+      k<-k+1L; rows[[k]]<-data.table(Species=keys$Species[i],who_region=keys$who_region[i],Year=keys$Year[i],
+        drug_a=drugs[ii],drug_b=drugs[jj],pairwise_n=nrp,phi=ph,p_value=ft$p.value,stable=(hit/n_boot)>=stable_frac) } }
+  e <- rbindlist(rows)
+  # FDR-adjust within each network, mark retained edges, and add an approximate phi CI.
+  if (nrow(e)) { e[, q_value := p.adjust(p_value,"BH"), by=.(Species,who_region,Year)]
+    e[, retained := q_value < q_thr & abs(phi) >= phi_thr]
+    e[, phi_lo := phi - 1.96*sqrt(pmax(1-phi^2,0)/pmax(pairwise_n-1,1))]
+    e[, phi_hi := phi + 1.96*sqrt(pmax(1-phi^2,0)/pmax(pairwise_n-1,1))] }
+  e[]
+}
+
+# Run edge estimation (bootstrap count controlled by N_BOOT_EDGE).
+edges <- pairwise_edges(long, n_boot = N_BOOT_EDGE)
+```
+
+Of **`r nrow(edges)`** tested drug pairs, **`r sum(edges$retained)`** were retained
+(adjusted q < 0.05 and |phi| >= 0.15).
+
+```{r fig4-network, fig.height=7, fig.cap="Figure 4. Strongest retained co-resistance relationships, 2022-2024."}
+# One network per pathogen: antibiotics are nodes on a circle, edges are the
+# strongest recent co-resistance associations (line width ~ phi strength).
+ABBR <- c(Amikacin="AMK",Ceftazidime="CAZ",Ciprofloxacin="CIP",Clindamycin="CLI",Ceftriaxone="CRO",
+  Erythromycin="ERY",Gentamicin="GEN",Imipenem="IPM",Meropenem="MEM",Oxacillin="OXA",Penicillin="PEN",
+  `Piperacillin tazobactam`="TZP",`Trimethoprim sulfa`="SXT",Azithromycin="AZM",Levofloxacin="LVX",
+  Clarithromycin="CLR",Tetracycline="TET",Vancomycin="VAN",Linezolid="LZD",Cefoxitin="FOX")
+# Retained edges in the recent period, aggregated across region-years per pathogen.
+recent <- edges[retained==TRUE & Year>=2022]
+esum <- recent[, .(phi=weighted.mean(phi, pairwise_n), n=sum(pairwise_n), ry=.N),
+               by=.(Species,drug_a,drug_b)][n>=100 & ry>=2]
+# Build one circular-layout network plot per pathogen.
+netplots <- lapply(CFG$pathogens, function(sp){
+  s <- esum[Species==sp][order(-phi)][seq_len(min(10,.N))]
+  if (!nrow(s)) return(ggplot()+theme_void()+ggtitle(italic_sp(sp)))
+  # Place nodes evenly around a circle.
+  nodes <- unique(c(s$drug_a,s$drug_b)); ang <- seq(0,2*pi,length.out=length(nodes)+1)[-1]
+  np <- data.table(node=nodes, x=cos(ang), y=sin(ang))
+  s <- merge(merge(s, np, by.x="drug_a", by.y="node"), np, by.x="drug_b", by.y="node", suffixes=c("_a","_b"))
+  ggplot() +
+    geom_segment(data=s, aes(x_a,y_a,xend=x_b,yend=y_b, linewidth=phi), colour=NAVY, alpha=0.5) +
+    geom_point(data=np, aes(x,y), size=9, colour=BLUE, alpha=0.9) +
+    geom_text(data=np, aes(x,y,label=ifelse(node %in% names(ABBR),ABBR[node],substr(node,1,3))), colour="white", size=2.6) +
+    scale_linewidth(range=c(0.3,2.5), guide="none") + coord_fixed() + theme_void() +
+    ggtitle(italic_sp(sp)) + theme(plot.title=element_text(face="italic", size=10))
+})
+wrap_plots(netplots, ncol=2) + plot_annotation(title="Strongest retained co-resistance relationships, 2022-2024",
+  theme=theme(plot.title=element_text(face="bold", size=12)))
+```
+
+```{r fig-edge-forest, fig.height=4.5, fig.cap="Figure S6. Strongest co-resistance edges with 95% CI (navy = bootstrap-stable)."}
+# Forest plot of the three strongest edges per pathogen; whisker colour flags
+# whether the edge was bootstrap-stable.
+tops <- recent[order(Species,-phi)][, head(.SD,3), by=Species]
+tops[, lab := paste0(italic_sp(Species),": ",drug_a," + ",drug_b)]
+ggplot(tops, aes(phi, reorder(lab, phi))) +
+  geom_errorbarh(aes(xmin=phi_lo, xmax=phi_hi, colour=stable), height=0.3, linewidth=0.8) +
+  geom_point(colour=NAVY, size=2) + geom_vline(xintercept=0, colour=GRAY) +
+  scale_colour_manual(values=c(`TRUE`=NAVY, `FALSE`=GRAY), guide="none") +
+  labs(x="Phi coefficient (bootstrap-informed 95% CI)", y=NULL, title="Strongest co-resistance edges, 2022-2024")
+```
+
+```{r patterns}
+# ---- Mine multidrug antibiogram patterns and classify their behaviour over time ----
+# A pattern is a combination of 2-4 drugs an isolate is simultaneously resistant to.
+# Patterns are learned on the development period; each pattern-region-year is then
+# labelled present/insufficient and, over time, persistent / emerging / expanding.
+antibiogram_patterns <- function(ast_long, dev_end=2018, sizes=c(2,3,4), min_count=10, pc=3, ps=0.05) {
+  d <- ast_long[!is.na(drug_R), .(`Isolate Id`,Species,who_region,Year,drug,drug_R)]
+  # Denominator = isolates evaluated in each pathogen-region-year.
+  denom <- d[, .(denominator=uniqueN(`Isolate Id`)), by=.(Species,who_region,Year)]
+  # For each isolate, the set of drugs it is resistant to.
+  iso <- d[drug_R==1][, .(drugs=list(sort(unique(drug)))), by=.(`Isolate Id`,Species,who_region,Year)]
+  # Enumerate every 2-4 drug resistant combination each isolate expresses.
+  cnt <- list(); k <- 0L
+  for (i in seq_len(nrow(iso))) { dv<-iso$drugs[[i]]; if(length(dv)<2) next
+    for (s in sizes) { if(length(dv)<s) next
+      for (cc in combn(dv,s,simplify=FALSE)) { k<-k+1L
+        cnt[[k]]<-list(Species=iso$Species[i],who_region=iso$who_region[i],Year=iso$Year[i],pattern=paste(cc,collapse="|"),size=s) } } }
+  # Count how often each pattern occurs per region-year.
+  pos <- rbindlist(cnt)[, .(count=.N), by=.(Species,who_region,Year,pattern,size)]
+  pos <- merge(pos, denom, by=c("Species","who_region","Year"))
+  # Keep only patterns common enough in the development period (frozen vocabulary).
+  cand <- pos[Year<=dev_end, .(tot=sum(count)), by=.(Species,pattern,size)][tot>=min_count, .(Species,pattern,size)]
+  # Expand to a full pattern x region-year grid, filling absent combinations with 0.
+  frame <- merge(merge(denom, cand, by="Species", allow.cartesian=TRUE),
+                 pos[,.(Species,who_region,Year,pattern,count)], by=c("Species","who_region","Year","pattern"), all.x=TRUE)
+  frame[is.na(count), count:=0L][, support := count/denominator][, insufficient := denominator < 20]
+  # "present" if the pattern is common enough that year; NA where evidence is insufficient.
+  frame[, present := as.numeric(count>=pc & support>=ps)][insufficient==TRUE, present := NA_real_]
+  # Lagged presence/support to define the time-based taxonomy.
+  setorder(frame, Species, who_region, pattern, Year); key <- c("Species","who_region","pattern")
+  frame[, l1 := shift(present,1), by=key][, l2 := shift(present,2), by=key]
+  frame[, e1 := shift(insufficient,1)==FALSE, by=key][, e2 := shift(insufficient,2)==FALSE, by=key]
+  frame[, psup := shift(support,1), by=key]
+  # persistent: present two years running; emerging: newly present after two evaluable absences.
+  frame[, persistent := present==1 & l1==1][, emerging := present==1 & e1 & l1==0 & e2 & l2==0]
+  # expanding: support jumped by >= 10 points or doubled year on year.
+  frame[, expanding := (!insufficient) & !is.na(psup) & support>=ps & ((support-psup>=0.10)|(support>=2*psup))]
+  for (co in c("persistent","emerging","expanding")) { frame[is.na(get(co)),(co):=FALSE][,(co):=as.logical(get(co))] }
+  frame[, c("l1","l2","e1","e2","psup") := NULL][]
+}
+
+patterns <- antibiogram_patterns(long)
+# Recent taxonomy counts per pathogen for the supplementary figure/table.
+tax <- patterns[Year>=2022, .(Emerging=sum(emerging), Persistent=sum(persistent), Expanding=sum(expanding)), by=Species][order(match(Species,CFG$pathogens))]
+```
+
+```{r fig-taxonomy, fig.height=3.8, fig.cap="Figure S7. Antibiogram-pattern taxonomy, 2022-2024 (% of each pathogen's pattern-cells)."}
+# Grouped bars: share of each pathogen's recent pattern-cells that are emerging,
+# persistent or expanding (expressed as a percentage so pathogens are comparable).
+cells <- patterns[Year>=2022, .N, by=Species]
+tl <- melt(merge(tax, cells, by="Species"), id.vars=c("Species","N"), variable.name="Class", value.name="cnt")
+tl[, pct := 100*cnt/N][, lab := italic_sp(Species)]
+ggplot(tl, aes(lab, pct, fill=Class)) + geom_col(position="dodge", width=0.7) +
+  scale_fill_manual(values=c(Emerging=RED, Persistent=BLUE, Expanding=GOLD)) +
+  labs(x=NULL, y="Share of 2022-2024 pattern-cells (%)", fill=NULL, title="Antibiogram-pattern taxonomy")
+```
+
+# Forecasting: features, baselines and adapted STAPP
+
+```{r features}
+# ---- Turn the pattern table into a supervised forecasting frame ----
+# The target is next year's presence; predictors are lagged/rolling support and
+# presence. Also returns 3- and 7-year masked history matrices for the neural model
+# (each row's support over the preceding years, with a mask flagging missing years).
+build_features <- function(patterns) {
+  f <- as.data.table(copy(patterns)); setorder(f, Species, who_region, pattern, Year); key <- c("Species","who_region","pattern")
+  # Lagged presence/support and a 3-year rolling mean of support.
+  f[, lag_presence_1 := shift(present,1), by=key][, lag_presence_2 := shift(present,2), by=key]
+  f[, lag_support_1 := shift(support,1), by=key]
+  f[, rolling_support_3 := shift(frollmean(support,3,align="right",na.rm=TRUE),1), by=key]
+  # Average lagged support of the same pattern across regions in a year (spatial signal).
+  f[, spatial_lag_support := mean(lag_support_1, na.rm=TRUE), by=.(Species,pattern,Year)]
+  # Prediction target: whether the pattern is present the following year.
+  f[, target_year := Year+1L][, target_presence := shift(present,-1), by=key]
+  f <- f[!is.na(lag_presence_1) & !is.na(target_presence)][, target_presence := as.integer(target_presence)]
+  # Helper: build a value matrix + missingness mask for the previous `steps` years.
+  hist_mat <- function(steps){ vals<-matrix(0,nrow(f),steps); mask<-matrix(0,nrow(f),steps)
+    for (lag in (steps-1):0){ col<-steps-lag; s<-f[,shift(support,lag),by=key]$V1
+      mask[,col]<-as.integer(!is.na(s)); vals[,col]<-ifelse(is.na(s),0,s) }; list(vals=vals,mask=mask) }
+  list(features=f, h3=hist_mat(3), h7=hist_mat(7))
+}
+
+# ---- Row-normalise an adjacency matrix so each node's neighbour weights sum to 1 ----
+row_norm <- function(A){ rs<-rowSums(A); rs[rs==0]<-1; A/rs }
+
+# ---- Pattern-similarity graph: how often two patterns co-occur across region-years ----
+# Built per pathogen from development-period data as a Jaccard similarity between patterns.
+build_pattern_graph <- function(patterns, dev_end=2018) {
+  tr <- as.data.table(patterns)[Year<=dev_end]; out <- list()
+  for (sp in unique(tr$Species)) { g<-tr[Species==sp]; g[, ly:=paste(who_region,Year,sep="_")]
+    # Pattern x region-year presence matrix.
+    pv<-dcast(g, pattern~ly, value.var="present", fun.aggregate=function(x) max(x)); pats<-pv$pattern
+    m<-as.matrix(pv[,-1,with=FALSE]); m[is.na(m)]<-0; pres<-(m>=1)*1
+    # Jaccard = intersection / union of the region-years two patterns are both present in.
+    inter<-pres%*%t(pres); rs<-rowSums(pres); uni<-outer(rs,rs,"+")-inter
+    adj<-ifelse(uni>0,inter/uni,0); diag(adj)<-0; out[[sp]]<-list(patterns=pats,adjacency=adj) }
+  out
+}
+
+# ---- Location-similarity graph: which WHO regions have similar resistance profiles ----
+# Cosine similarity between regions' support vectors, kept as a k-nearest-neighbour graph
+# for several candidate k (2, 3, 4).
+build_location_graph <- function(patterns, dev_end=2018, ks=c(2,3,4)) {
+  tr<-as.data.table(patterns)[Year<=dev_end]; tr[, sp_pat:=paste(Species,pattern,sep="|")]
+  prof<-dcast(tr, who_region~sp_pat, value.var="support", fun.aggregate=mean); regions<-prof$who_region
+  m<-as.matrix(prof[,-1,with=FALSE]); m[is.na(m)]<-0; nrm<-sqrt(rowSums(m^2)); nrm[nrm==0]<-1
+  sim<-(m/nrm)%*%t(m/nrm); diag(sim)<-0
+  # Keep only each region's k most similar neighbours (symmetrised).
+  knn<-function(k){k<-min(k,length(regions)-1); A<-matrix(0,nrow(sim),ncol(sim))
+    for(i in seq_len(nrow(sim))){nb<-order(sim[i,],decreasing=TRUE)[seq_len(k)]; A[i,nb]<-sim[i,nb]}; pmax(A,t(A))}
+  list(regions=regions, candidates=setNames(lapply(ks,knn), paste0("k",ks)))
+}
+
+# ---- Add graph-neighbour features: each row's support averaged over graph neighbours ----
+# One feature propagates support across similar patterns, another across similar regions;
+# these are the graph inputs the adapted-STAPP model consumes.
+add_graph_features <- function(feat, pg, lg, k=3) {
+  f<-as.data.table(copy(feat)); pl<-list()
+  for (sp in names(pg)) { pats<-pg[[sp]]$patterns; An<-row_norm(pg[[sp]]$adjacency); sub<-f[Species==sp]; if(!nrow(sub)) next
+    pv<-dcast(sub, who_region+Year~pattern, value.var="support", fun.aggregate=mean); keys<-pv[,.(who_region,Year)]
+    M<-matrix(0,nrow(pv),length(pats),dimnames=list(NULL,pats)); have<-intersect(colnames(pv),pats)
+    if(length(have)) M[,have]<-as.matrix(pv[,..have]); M[is.na(M)]<-0
+    nb<-as.data.table(M%*%t(An)); setnames(nb,pats); nb<-cbind(keys,nb)
+    lm<-melt(nb, id.vars=c("who_region","Year"), variable.name="pattern", value.name="val")
+    lm[, `:=`(Species=sp, pattern=as.character(pattern))]; pl[[sp]]<-lm }
+  patm<-rbindlist(pl); f[, pattern_graph_neighbor_support:=0]
+  f[patm, on=.(Species,who_region,Year,pattern), pattern_graph_neighbor_support:=i.val]
+  A<-row_norm(lg$candidates[[paste0("k",k)]]); regions<-lg$regions
+  pv<-dcast(f, Species+pattern+Year~who_region, value.var="support", fun.aggregate=mean); keys<-pv[,.(Species,pattern,Year)]
+  M<-matrix(0,nrow(pv),length(regions),dimnames=list(NULL,regions)); have<-intersect(colnames(pv),regions)
+  if(length(have)) M[,have]<-as.matrix(pv[,..have]); M[is.na(M)]<-0
+  nb<-as.data.table(M%*%t(A)); setnames(nb,regions); nb<-cbind(keys,nb)
+  ll<-melt(nb, id.vars=c("Species","pattern","Year"), variable.name="who_region", value.name="val")
+  ll[, who_region:=as.character(who_region)]; f[, location_graph_neighbor_support:=0]
+  f[ll, on=.(Species,pattern,Year,who_region), location_graph_neighbor_support:=i.val]
+  f[is.na(pattern_graph_neighbor_support), pattern_graph_neighbor_support:=0]
+  f[is.na(location_graph_neighbor_support), location_graph_neighbor_support:=0][]
+}
+# ---- Assemble the modelling frame: base features + both graphs + graph-neighbour features ----
+bf <- build_features(patterns)                                   # tabular features + history matrices
+pg <- build_pattern_graph(patterns); lg <- build_location_graph(patterns)  # similarity graphs
+feat <- add_graph_features(bf$features, pg, lg, 3)               # frame with graph features attached
+```
+
+```{r metrics-fns}
+# ---- Area under the precision-recall curve (AUPRC): rank quality for a rare positive class ----
+auprc <- function(y,p){y<-as.integer(y); if(length(unique(y))<2) return(NA_real_)
+  o<-order(p,decreasing=TRUE); y<-y[o]; tp<-cumsum(y); fp<-cumsum(1-y)
+  prec<-tp/(tp+fp); rec<-tp/sum(y); sum((rec-c(0,head(rec,-1)))*prec)}
+
+# ---- Area under the ROC curve (AUROC) via the rank-sum (Mann-Whitney) formula ----
+auroc <- function(y,p){y<-as.integer(y); if(length(unique(y))<2) return(NA_real_)
+  n1<-sum(y==1);n0<-sum(y==0); (sum(rank(p)[y==1])-n1*(n1+1)/2)/(n1*n0)}
+
+# ---- Brier score: mean squared error between predicted probability and outcome ----
+brier <- function(y,p) mean((p-as.integer(y))^2)
+
+# ---- Block-bootstrap 95% CI for AUPRC, resampling whole WHO regions ----
+# Resampling by region (not by row) respects within-region correlation.
+boot_auprc <- function(y,p,region,n_boot=500,seed=1){set.seed(seed)
+  df<-data.frame(y=as.integer(y),p=pmin(pmax(p,0),1),r=as.character(region)); rs<-unique(df$r); v<-numeric(0)
+  for(b in seq_len(n_boot)){ch<-sample(rs,length(rs),replace=TRUE); s<-do.call(rbind,lapply(ch,function(x)df[df$r==x,]))
+    if(length(unique(s$y))>1) v<-c(v,auprc(s$y,s$p))}; if(!length(v)) return(c(NA,NA)); as.numeric(quantile(v,c(.025,.975),na.rm=TRUE))}
+```
+
+```{r baselines-neural, results='hide'}
+# Categorical and numeric predictor columns, and the identifier columns carried through predictions.
+CATS<-c("Species","who_region","pattern"); NUMS<-c("lag_presence_1","lag_presence_2","lag_support_1","rolling_support_3","spatial_lag_support","support","denominator")
+IDS<-c("Species","who_region","pattern","target_year","target_presence")
+
+# ---- Build a standardised model matrix: one-hot categoricals + scaled numerics ----
+# Scaling uses the training set's mean/SD so evaluation data are transformed consistently.
+design_matrix <- function(train, eval_){ levs<-lapply(CATS,function(c) sort(unique(as.character(train[[c]])))); names(levs)<-CATS
+  oh<-function(df){ parts<-lapply(CATS,function(c){x<-as.character(df[[c]]); L<-levs[[c]]
+      m<-matrix(0,length(x),length(L),dimnames=list(NULL,paste0(c,seq_along(L))))
+      for(j in seq_along(L)) m[x==L[j],j]<-1; m})
+    nm<-as.matrix(df[,..NUMS]); nm[is.na(nm)]<-0; cbind(do.call(cbind,parts),nm)}
+  Xtr<-oh(train);Xev<-oh(eval_); mu<-colMeans(Xtr);sd<-apply(Xtr,2,sd);sd[sd==0]<-1; list(Xtr=scale(Xtr,mu,sd),Xev=scale(Xev,mu,sd))}
+
+# ---- Running (expanding-window) mode of a series, using only past values at each point ----
+# Powers the "historical mode" baseline without leaking future information.
+expanding_mode <- function(v){out<-rep(NA_real_,length(v));cn<-integer(0);nm<-character(0)
+  for(i in seq_along(v)){if(length(cn))out[i]<-as.numeric(nm[which.max(cn)]);x<-v[i]
+    if(!is.na(x)){k<-as.character(x);j<-match(k,nm);if(is.na(j)){nm<-c(nm,k);cn<-c(cn,1L)}else cn[j]<-cn[j]+1L}};out}
+
+# ---- Fit the non-neural forecasting baselines and return their predictions ----
+# Persistence (last value), historical mode, historical prevalence rank, a penalised
+# logistic regression (glmnet) and a random forest (ranger), all class-weighted.
+run_baselines <- function(feat, dev_end=2018, seed=20260628) {
+  f<-as.data.table(copy(feat)); train<-f[target_year<=dev_end]; ev<-f[target_year>dev_end]; pr<-list()
+  pr[["persistence"]]<-cbind(ev[,..IDS], model="persistence", predicted_probability=as.numeric(ev$lag_presence_1))
+  setorder(f,Species,who_region,pattern,Year); f[, hm:=expanding_mode(present), by=.(Species,who_region,pattern)]
+  pr[["historical_mode"]]<-cbind(ev[,..IDS], model="historical_mode", predicted_probability=ifelse(is.na(f[target_year>dev_end]$hm),0,f[target_year>dev_end]$hm))
+  ev[, hr:=frank(fifelse(is.na(lag_support_1),0,lag_support_1),ties.method="average")/.N, by=.(Species,who_region,target_year)]
+  pr[["historical_prevalence_rank"]]<-cbind(ev[,..IDS], model="historical_prevalence_rank", predicted_probability=ev$hr)
+  dm<-design_matrix(train,ev); ytr<-train$target_presence; w<-ifelse(ytr==1,sum(ytr==0)/max(sum(ytr==1),1),1)
+  cvf<-cv.glmnet(dm$Xtr,ytr,family="binomial",alpha=0,weights=w,nfolds=5)
+  pr[["regularized_logistic"]]<-cbind(ev[,..IDS], model="regularized_logistic", predicted_probability=as.numeric(predict(cvf,dm$Xev,s="lambda.min",type="response")))
+  set.seed(seed); Xtr<-as.data.frame(dm$Xtr);Xev<-as.data.frame(dm$Xev); sf<-paste0("v",seq_len(ncol(Xtr))); colnames(Xtr)<-sf;colnames(Xev)<-sf
+  Xtr$y<-factor(ytr); rf<-ranger(dependent.variable.name="y",data=Xtr,num.trees=300,min.node.size=5,probability=TRUE,
+    class.weights=c("0"=1,"1"=sum(ytr==0)/max(sum(ytr==1),1)),num.threads=4,seed=seed)
+  pr[["random_forest"]]<-cbind(ev[,..IDS], model="random_forest", predicted_probability=predict(rf,Xev)$predictions[,"1"])
+  rbindlist(pr)
+}
+
+# ---- Temporal encoder: summarise a masked year-history into a fixed-length vector ----
+# Two modes: multi-head self-attention (used by STAPP) or an LSTM (the temporal baseline).
+# The mask lets the model ignore missing years rather than treat them as zero.
+temporal_encoder <- nn_module("te", initialize=function(hidden,heads,mode){self$mode<-mode; self$ip<-nn_linear(2,hidden)
+    if(mode=="attention"){self$attn<-nn_multihead_attention(hidden,heads,batch_first=TRUE);self$pool<-nn_linear(hidden,hidden)}
+    else if(mode=="lstm") self$rnn<-nn_lstm(hidden,hidden,batch_first=TRUE)},
+  forward=function(values,mask){x<-self$ip(torch_stack(list(values,mask),dim=3))
+    if(self$mode=="attention"){kpm<-(mask<0.5); am<-kpm$sum(dim=2)==kpm$size(2)
+      if(as.logical(am$any()$item())){kpm<-kpm$clone();kpm[am,kpm$size(2)]<-FALSE}
+      att<-self$attn(x,x,x,key_padding_mask=kpm)[[1]]; v<-mask$unsqueeze(3)
+      return(self$pool((att*v)$sum(dim=2)/v$sum(dim=2)$clamp(min=1)))}
+    else if(self$mode=="lstm"){h<-self$rnn(x)[[2]][[1]]; return(h[h$size(1),,])}; x$mean(dim=2)})
+
+# ---- Adapted-STAPP network: static features + two temporal encoders + optional graph features ----
+# Toggle flags (up = pattern-graph feature, ul = location-graph feature, tmode = temporal mode)
+# let the same class serve as the full model or any of its ablations. All branches are
+# concatenated and passed through a small classifier head that outputs one logit per row.
+adapted_stapp <- nn_module("as", initialize=function(n_static,up,ul,tmode,hidden=32,heads=4){
+    self$up<-up;self$ul<-ul;self$tmode<-tmode; self$sp<-nn_sequential(nn_linear(n_static,hidden),nn_relu()); dims<-hidden
+    if(tmode!="none"){self$se<-temporal_encoder(hidden,heads,tmode);self$le<-temporal_encoder(hidden,heads,tmode);dims<-dims+2*hidden}
+    if(up){self$pp<-nn_sequential(nn_linear(1,hidden%/%2),nn_relu());dims<-dims+hidden%/%2}
+    if(ul){self$lp<-nn_sequential(nn_linear(1,hidden%/%2),nn_relu());dims<-dims+hidden%/%2}
+    self$head<-nn_sequential(nn_linear(dims,hidden),nn_relu(),nn_dropout(0.2),nn_linear(hidden,1))},
+  forward=function(static,sv,sm,lv,lm,pf=NULL,lf=NULL){parts<-list(self$sp(static))
+    if(self$tmode!="none"){parts[[length(parts)+1]]<-self$se(sv,sm);parts[[length(parts)+1]]<-self$le(lv,lm)}
+    if(self$up)parts[[length(parts)+1]]<-self$pp(pf$unsqueeze(2)); if(self$ul)parts[[length(parts)+1]]<-self$lp(lf$unsqueeze(2))
+    self$head(torch_cat(parts,dim=2))$squeeze(2)})
+
+# ---- Focal loss: down-weights easy examples so the rare positive class dominates learning ----
+focal_loss <- function(lg,tg,gamma,pw){pr<-torch_sigmoid(lg); ce<-nnf_binary_cross_entropy_with_logits(lg,tg,reduction="none")
+  pt<-pr*tg+(1-pr)*(1-tg); w<-torch_where(tg==1,pw,torch_ones_like(tg)); ((1-pt)^gamma*ce*w)$mean()}
+
+# ---- Train the adapted-STAPP network (or an ablation) and return averaged predictions ----
+# Builds the model matrix and history tensors, then trains one model per random seed with
+# early stopping on tuning loss, and averages the seed predictions for stability.
+train_neural <- function(feat,h3,h7,cfg,up,ul,tmode,uf,gamma=2,seeds=NULL){
+  f<-as.data.table(copy(feat)); de<-cfg$validation$development[2]; te<-cfg$validation$tuning[2]
+  if(is.null(seeds)) seeds<-cfg$validation$neural_seeds; tm<-f$target_year<=de
+  levs<-lapply(CATS,function(c)sort(unique(as.character(f[[c]])))); names(levs)<-CATS
+  oh<-do.call(cbind,lapply(CATS,function(c){x<-factor(as.character(f[[c]]),levels=levs[[c]]);m<-model.matrix(~x-1);colnames(m)<-paste0(c,seq_len(ncol(m)));m}))
+  nm<-as.matrix(f[,..NUMS]);nm[is.na(nm)]<-0; X<-cbind(oh,nm); mu<-colMeans(X[tm,]);sd<-apply(X[tm,],2,sd);sd[sd==0]<-1; X<-scale(X,mu,sd)
+  y<-as.numeric(f$target_presence); um<-f$target_year>de&f$target_year<=te; em<-f$target_year>de
+  pf<-f$pattern_graph_neighbor_support; lf<-f$location_graph_neighbor_support
+  mk<-function(m)list(static=torch_tensor(X[m,,drop=FALSE],dtype=torch_float()),sv=torch_tensor(h3$vals[m,,drop=FALSE],dtype=torch_float()),
+    sm=torch_tensor(h3$mask[m,,drop=FALSE],dtype=torch_float()),lv=torch_tensor(h7$vals[m,,drop=FALSE],dtype=torch_float()),
+    lm=torch_tensor(h7$mask[m,,drop=FALSE],dtype=torch_float()),pf=if(up)torch_tensor(pf[m],dtype=torch_float())else NULL,
+    lf=if(ul)torch_tensor(lf[m],dtype=torch_float())else NULL)
+  tb<-mk(tm);ub<-mk(um);eb<-mk(em); ytr<-torch_tensor(y[tm],dtype=torch_float());ytu<-torch_tensor(y[um],dtype=torch_float())
+  pos<-max(sum(y[tm]),1);neg<-max(sum(tm)-pos,1); pw<-torch_tensor(neg/pos)
+  fwd<-function(md,b) if(up||ul) md(b$static,b$sv,b$sm,b$lv,b$lm,b$pf,b$lf) else md(b$static,b$sv,b$sm,b$lv,b$lm)
+  P<-matrix(0,sum(em),length(seeds))
+  for(si in seq_along(seeds)){torch_manual_seed(seeds[si]); md<-adapted_stapp(ncol(X),up,ul,tmode)
+    opt<-optim_adam(md$parameters,lr=1e-3,weight_decay=1e-4); best<-NULL;bl<-Inf;pat<-0
+    lf2<-if(uf)function(a,b)focal_loss(a,b,gamma,pw) else function(a,b)nnf_binary_cross_entropy_with_logits(a,b,pos_weight=pw)
+    for(ep in 1:250){md$train();opt$zero_grad();loss<-lf2(fwd(md,tb),ytr);loss$backward();opt$step();md$eval()
+      with_no_grad({vl<-lf2(fwd(md,ub),ytu)$item()})
+      if(vl<bl-1e-5){bl<-vl;pat<-0;best<-lapply(md$state_dict(),function(t)t$clone())}else pat<-pat+1; if(pat>=20)break}
+    if(!is.null(best))md$load_state_dict(best); md$eval(); with_no_grad({P[,si]<-as.numeric(torch_sigmoid(fwd(md,eb)))})}
+  ev<-f[em,..IDS]; ev$predicted_probability<-rowMeans(P); ev
+}
+
+# ---- Fit the non-neural baselines ----
+baselines <- run_baselines(feat)
+
+# ---- Neural baselines: LSTM-only, and pattern-graph + temporal (rungs below full STAPP) ----
+nb_lstm  <- train_neural(feat, bf$h3, bf$h7, CFG, FALSE, FALSE, "lstm", FALSE)
+nb_lstm$model <- "lstm"
+nb_pgt   <- train_neural(feat, bf$h3, bf$h7, CFG, TRUE, FALSE, "lstm", FALSE)
+nb_pgt$model <- "pattern_graph_temporal"
+
+# ---- Full adapted STAPP: search the focal-loss gamma on tuning AUPRC, then refit at the best gamma ----
+tun_end <- CFG$validation$tuning[2]
+gsearch <- sapply(c(1,2,3), function(gm){
+  ev <- train_neural(feat, bf$h3, bf$h7, CFG, TRUE, TRUE, "attention", TRUE, gamma=gm)
+  tu <- ev[target_year<=tun_end]; auprc(tu$target_presence, pmin(pmax(tu$predicted_probability,0),1)) })
+best_gamma <- c(1,2,3)[which.max(gsearch)]
+stapp_ev <- train_neural(feat, bf$h3, bf$h7, CFG, TRUE, TRUE, "attention", TRUE, gamma=best_gamma)
+stapp_ev$model <- "adapted_stapp"
+
+# ---- Ablations: remove one component at a time and record its tuning AUPRC ----
+ablations <- rbindlist(list(
+  data.table(variant="full_adapted_stapp", tuning_auprc=max(gsearch)),
+  data.table(variant="no_pattern_graph",  tuning_auprc={ev<-train_neural(feat,bf$h3,bf$h7,CFG,FALSE,TRUE,"attention",TRUE,best_gamma);tu<-ev[target_year<=tun_end];auprc(tu$target_presence,pmin(pmax(tu$predicted_probability,0),1))}),
+  data.table(variant="no_location_graph", tuning_auprc={ev<-train_neural(feat,bf$h3,bf$h7,CFG,TRUE,FALSE,"attention",TRUE,best_gamma);tu<-ev[target_year<=tun_end];auprc(tu$target_presence,pmin(pmax(tu$predicted_probability,0),1))}),
+  data.table(variant="no_temporal_attention", tuning_auprc={ev<-train_neural(feat,bf$h3,bf$h7,CFG,TRUE,TRUE,"lstm",TRUE,best_gamma);tu<-ev[target_year<=tun_end];auprc(tu$target_presence,pmin(pmax(tu$predicted_probability,0),1))}),
+  data.table(variant="no_focal_loss", tuning_auprc={ev<-train_neural(feat,bf$h3,bf$h7,CFG,TRUE,TRUE,"attention",FALSE,best_gamma);tu<-ev[target_year<=tun_end];auprc(tu$target_presence,pmin(pmax(tu$predicted_probability,0),1))})))
+
+# ---- Combine every model's predictions into one long table for validation ----
+all_preds <- rbindlist(list(baselines,
+  cbind(nb_lstm[,..IDS], model="lstm", predicted_probability=nb_lstm$predicted_probability),
+  cbind(nb_pgt[,..IDS], model="pattern_graph_temporal", predicted_probability=nb_pgt$predicted_probability),
+  cbind(stapp_ev[,..IDS], model="adapted_stapp", predicted_probability=stapp_ev$predicted_probability)), use.names=TRUE)
+```
+
+The focal-loss gamma search selected **gamma = `r best_gamma`**.
+
+```{r fig-arch, fig.height=3.2, fig.cap="Figure 5. Adapted-STAPP architecture (schematic)."}
+# Hand-drawn schematic of the model's data flow (boxes + arrows), not a computed figure.
+boxes <- data.frame(
+  x=c(1,1,3,5,7), y=c(3,1,2,2,2), w=c(1.7,1.7,1.7,1.7,1.7), h=c(0.9,0.9,0.9,0.9,0.9),
+  lab=c("Pattern graph\n(Jaccard sim.)","Location graph\n(kNN sim.)","3- & 7-step\nmasked history\n(attention)","Concatenated\nrepresentation","Focal-loss\nsigmoid head"),
+  col=c(TEAL,BROWN,PURPLE,NAVY,GOLD))
+ggplot(boxes) +
+  geom_tile(aes(x,y,width=w,height=h,fill=col), alpha=0.25, colour=NA) +
+  geom_text(aes(x,y,label=lab), size=2.7, colour=NAVY) +
+  annotate("segment", x=c(1.9,1.9,3.9,5.9), y=c(3,1,2,2), xend=c(2.9,2.9,4.9,6.9), yend=c(2.2,1.8,2,2),
+           arrow=arrow(length=unit(0.15,"cm")), colour=GRAY) +
+  scale_fill_identity() + coord_fixed(0.9) + theme_void() +
+  ggtitle("Adapted-STAPP architecture (schematic)") + theme(plot.title=element_text(face="bold", size=12))
+```
+
+```{r fig6-ablation, fig.height=3.4, fig.cap="Figure 6. Adapted-STAPP ablations (tuning-period AUPRC; gold = full model)."}
+# Bar chart of each ablation's tuning AUPRC; the full model is highlighted in gold.
+ab <- copy(ablations); ab[, lab := c("Full adapted STAPP","- pattern graph","- location graph","- temporal attention (->LSTM)","- focal loss (->BCE)")]
+ab[, full := variant=="full_adapted_stapp"]
+ggplot(ab, aes(tuning_auprc, reorder(lab, tuning_auprc), fill=full)) +
+  geom_col(width=0.7, show.legend=FALSE) + scale_fill_manual(values=c(`TRUE`=GOLD,`FALSE`=BLUE)) +
+  labs(x="Tuning-period AUPRC", y=NULL, title="Adapted-STAPP ablations")
+```
+
+```{r tab3-ablation}
+kable(ab[, .(Variant=lab, `Tuning AUPRC`=round(tuning_auprc,3))], caption="Table 3. Ablation results (tuning-period AUPRC).")
+```
+
+# Validation, calibration and alerts
+
+```{r validation}
+# ---- Compute AUPRC / AUROC / Brier (with bootstrap AUPRC CI) for every model on one split ----
+metric_rows <- function(pred, split, n_boot=500){
+  rbindlist(lapply(sort(unique(pred$model)), function(m){ g<-pred[model==m]; y<-g$target_presence; p<-pmin(pmax(g$predicted_probability,0),1)
+    ci<-if(length(unique(y))>1) boot_auprc(y,p,g$who_region,n_boot) else c(NA,NA)
+    data.table(split=split, model=m, n=nrow(g), events=sum(y), auprc=auprc(y,p), auroc=auroc(y,p), brier=brier(y,p), lo=ci[1], hi=ci[2]) }))
+}
+# Evaluate on the tuning window and on the untouched locked-test window.
+tun_end <- CFG$validation$tuning[2]
+val <- rbindlist(list(metric_rows(all_preds[target_year<=tun_end],"Tuning 2019-2021", N_BOOT_MET),
+                      metric_rows(all_preds[target_year>tun_end],"Locked test 2022-2024", N_BOOT_MET)))
+# Best model by AUPRC on each split (the tuning winner becomes the operational model).
+best_tuning <- val[split=="Tuning 2019-2021"][which.max(auprc)]$model
+best_locked <- val[split=="Locked test 2022-2024"][which.max(auprc)]$model
+```
+
+```{r fig7-temporal, fig.height=5, fig.cap="Figure 7. Temporal model validation (AUPRC, bootstrap 95% CI)."}
+# Forest plot of AUPRC (with bootstrap CI) for all eight models on both splits.
+ORDER <- c("persistence","historical_mode","historical_prevalence_rank","regularized_logistic","random_forest","lstm","pattern_graph_temporal","adapted_stapp")
+LAB <- c("Persistence","Historical mode","Historical prevalence rank","Regularized logistic","Random forest","LSTM (temporal only)","Pattern graph + temporal","Adapted STAPP")
+vv <- copy(val); vv[, model := factor(model, levels=ORDER, labels=LAB)]
+ggplot(vv, aes(auprc, model)) +
+  geom_errorbarh(aes(xmin=lo, xmax=hi), height=0.25, colour=GRAY) +
+  geom_point(colour=NAVY, size=2.4) + facet_wrap(~split) + xlim(0,1) +
+  labs(x="AUPRC", y=NULL, title="Temporal model validation (bootstrap 95% CI)")
+```
+
+```{r tab4-temporal}
+kable(val[order(split,-auprc), .(Split=split, Model=factor(model,ORDER,LAB), n, Events=events,
+  AUPRC=round(auprc,3), `95% CI`=sprintf("%.3f-%.3f",lo,hi), AUROC=round(auroc,3), Brier=round(brier,3))],
+  caption="Table 4. Temporal validation metrics, all eight models.")
+```
+
+```{r fig8-calibration, fig.height=4.6, fig.cap="Figure 8. Locked-test calibration."}
+# Reliability curve: within probability bins, compare mean predicted vs. observed rate.
+# A well-calibrated model tracks the diagonal.
+cal_models <- c("persistence","regularized_logistic","random_forest","adapted_stapp")
+lt <- all_preds[target_year>tun_end & model %in% cal_models]
+# For one model, bin predictions into deciles and return (mean predicted, observed rate).
+calib_one <- function(p, y){ p<-pmin(pmax(p,0),1); br<-unique(quantile(p, seq(0,1,length.out=9), na.rm=TRUE))
+  if(length(br)<3) return(data.table(mp=mean(p), op=mean(y)))
+  b<-cut(p, br, include.lowest=TRUE); data.table(mp=as.numeric(tapply(p,b,mean)), op=as.numeric(tapply(y,b,mean))) }
+calib <- lt[, calib_one(predicted_probability, target_presence), by=model]
+ggplot(calib, aes(mp, op, colour=model)) + geom_abline(linetype=2, colour=GRAY) +
+  geom_line() + geom_point(size=1.5) + xlim(0,1) + ylim(0,1) +
+  scale_colour_manual(values=c(persistence=GRAY, regularized_logistic=BLUE, random_forest=NAVY, adapted_stapp=GOLD)) +
+  labs(x="Mean predicted probability", y="Observed event proportion", colour=NULL, title="Calibration in the locked 2022-2024 test set")
+```
+
+## Geographic holdout and alert threshold
+
+```{r geographic}
+# ---- Leave-one-WHO-region-out validation: train on five regions, test on the held-out one ----
+# Measures how well each model transports to a region it never saw during training.
+geo_val <- function(feat, seed=20260628){
+  f<-as.data.table(copy(feat)); f<-f[target_year<=CFG$validation$development[2]]
+  rows<-list()
+  for (rg in sort(unique(f$who_region))){ tr<-f[who_region!=rg]; te<-f[who_region==rg]
+    if(uniqueN(tr$target_presence)<2 || uniqueN(te$target_presence)<2) next
+    pp<-as.numeric(te$lag_presence_1); pp[is.na(pp)]<-0
+    rows[[paste(rg,"persistence")]]<-data.table(region=rg,model="persistence",n=nrow(te),auprc=auprc(te$target_presence,pp),auroc=auroc(te$target_presence,pp),brier=brier(te$target_presence,pp))
+    dm<-design_matrix(tr,te); ytr<-tr$target_presence
+    cvf<-cv.glmnet(dm$Xtr,ytr,family="binomial",alpha=0,weights=ifelse(ytr==1,sum(ytr==0)/max(sum(ytr==1),1),1),nfolds=5)
+    pl<-as.numeric(predict(cvf,dm$Xev,s="lambda.min",type="response"))
+    rows[[paste(rg,"lr")]]<-data.table(region=rg,model="regularized_logistic",n=nrow(te),auprc=auprc(te$target_presence,pl),auroc=auroc(te$target_presence,pl),brier=brier(te$target_presence,pl))
+    Xtr<-as.data.frame(dm$Xtr);Xev<-as.data.frame(dm$Xev);sf<-paste0("v",seq_len(ncol(Xtr)));colnames(Xtr)<-sf;colnames(Xev)<-sf;Xtr$y<-factor(ytr)
+    rf<-ranger(dependent.variable.name="y",data=Xtr,num.trees=300,min.node.size=5,probability=TRUE,class.weights=c("0"=1,"1"=sum(ytr==0)/max(sum(ytr==1),1)),num.threads=4,seed=seed)
+    pr<-predict(rf,Xev)$predictions[,"1"]
+    rows[[paste(rg,"rf")]]<-data.table(region=rg,model="random_forest",n=nrow(te),auprc=auprc(te$target_presence,pr),auroc=auroc(te$target_presence,pr),brier=brier(te$target_presence,pr)) }
+  rbindlist(rows)
+}
+geo <- geo_val(feat)
+```
+
+```{r fig-geo, fig.height=4.6, fig.cap="Figure S9. Leave-one-WHO-region-out performance."}
+# AUPRC per held-out region, one point per model, showing how transportability varies.
+ggplot(geo, aes(auprc, region, colour=model)) + geom_point(size=2.6, position=position_dodge(0.5)) + xlim(0,1) +
+  scale_colour_manual(values=c(persistence=GRAY, regularized_logistic=BLUE, random_forest=NAVY)) +
+  labs(x="AUPRC", y=NULL, colour=NULL, title="Geographic holdout performance")
+```
+
+```{r alerts}
+# ---- Choose an alert threshold on tuning data, with a guard against degenerate rules ----
+# Picks the threshold that maximises recall subject to a precision floor and an alert-rate
+# ceiling; if none qualifies it falls back to the 95th percentile and flags "not deployable".
+select_threshold <- function(tun, min_prec=0.25, max_rate=0.5){
+  p<-pmin(pmax(tun$predicted_probability,0),1); y<-tun$target_presence
+  cand<-sort(unique(p)); best<-NA; brec<- -1
+  for (t in cand){ pred<-p>=t; if(mean(pred)>max_rate) next; prec<-sum(pred&y==1)/max(sum(pred),1); rec<-sum(pred&y==1)/max(sum(y),1)
+    if(prec>=min_prec && rec>brec){brec<-rec;best<-t} }
+  if(is.na(best)) list(threshold=as.numeric(quantile(p,0.95)), deployable=FALSE) else list(threshold=best, deployable=TRUE)
+}
+# Operational model = tuning-period winner; select its threshold on tuning, apply on locked test.
+op_model <- best_tuning
+tun <- all_preds[target_year<=tun_end & model==op_model]
+lt_op <- all_preds[target_year>tun_end & model==op_model]
+sel <- select_threshold(tun)
+# ---- Precision/recall/alert-rate of the chosen threshold on both splits ----
+thr_tab <- rbindlist(lapply(list(list("Tuning",tun), list("Locked test",lt_op)), function(z){ g<-z[[2]]; p<-g$predicted_probability; y<-g$target_presence; pred<-p>=sel$threshold
+  data.table(Split=z[[1]], Threshold=round(sel$threshold,3), Alerts=sum(pred), `Alert rate (%)`=round(100*mean(pred),1),
+             Precision=round(sum(pred&y==1)/max(sum(pred),1),3), Recall=round(sum(pred&y==1)/max(sum(y),1),3)) }))
+# Locked-test alert register, summarised by pathogen.
+alerts <- lt_op[predicted_probability>=sel$threshold]
+alert_reg <- alerts[, .(Alerts=.N, `Mean prob`=round(mean(predicted_probability),3)), by=Species][order(-Alerts)]
+```
+
+The operational model (highest tuning AUPRC) is **`r op_model`**; the selected alert threshold is
+**`r round(sel$threshold,3)`** (`r if (sel$deployable) "deployable" else "not deployable"`), flagging
+**`r nrow(alerts)`** locked-test cases.
+
+```{r tab5-threshold}
+kable(thr_tab, caption=paste0("Table 5. Selected ", op_model, " alert-threshold performance."))
+kable(alert_reg[, .(Pathogen=italic_sp(Species), Alerts, `Mean predicted probability`=`Mean prob`)],
+      caption="Table 6. Early-warning alert register by pathogen (locked test).")
+```
+
+# Session information
+
+```{r session}
+# Record the run configuration and R version for reproducibility.
+cat("QUICK =", QUICK, " | neural seeds =", N_SEEDS, " | edge bootstraps =", N_BOOT_EDGE, "\n")
+sessionInfo()$R.version$version.string
+```
